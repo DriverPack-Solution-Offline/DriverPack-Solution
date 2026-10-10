@@ -1,0 +1,267 @@
+use crate::driver_index::{
+    CatalogSignatureCache, DriverIndex, InfInfo, source_fingerprint_excluding,
+};
+use crate::temp_workspace::TempWorkspace;
+use crate::utils::console::{ConsoleType, write_console};
+use crate::utils::sevenzip::SevenZip;
+use crate::utils::utils::get_file_list;
+use anyhow::{Context, Result, anyhow};
+use rust_i18n::t;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::mpsc::channel;
+use std::time::UNIX_EPOCH;
+use threadpool::ThreadPool;
+use windows::Win32::Storage::FileSystem::{
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+};
+use windows::core::HSTRING;
+
+/// 创建索引文件
+///
+/// # 参数
+///
+/// - `drive_path` - 驱动路径
+/// - `password` - 驱动密码
+/// - `save_index_path` - 保存索引路径
+///
+/// # 返回值
+///
+/// - `Result<()>` - 创建索引文件结果
+pub fn create_index(
+    drive_path: &Path,
+    password: Option<&str>,
+    save_path: &Path,
+    compress: bool,
+) -> Result<(u32, u32, u32, u32)> {
+    let workspace = TempWorkspace::create("index")?;
+    let zip = SevenZip::new_in(workspace.path()).with_context(|| "create sevenZip failed")?;
+
+    // INF文件父路径
+    let inf_parent_path;
+    // INF文件列表
+    let mut inf_list;
+    // 保存索引路径
+    let index_path;
+
+    if drive_path.is_dir() {
+        // 从驱动目录中创建索引文件
+        inf_list = get_file_list(drive_path, "*.inf").with_context(|| "get inf list failed")?;
+        inf_parent_path = drive_path.to_path_buf();
+        // 如果输入的索引路径是相对路径，则令实际路径为驱动目录所在路径
+        index_path = if save_path.is_relative() {
+            drive_path.join(save_path)
+        } else {
+            save_path.to_path_buf()
+        };
+    } else {
+        // 从文件中创建索引文件
+        inf_parent_path = workspace.path().join(
+            drive_path
+                .file_stem()
+                .ok_or_else(|| anyhow!("driver package has no file name"))?,
+        );
+
+        // 解压全部INF文件
+        if let Err(e) = zip.extract_files_from_paths(
+            drive_path,
+            password,
+            &["*.inf", "*.cat"],
+            &inf_parent_path,
+        ) {
+            drop(zip);
+            return Err(anyhow!("{}: {}", t!("driver-unzip-failed"), e));
+        }
+
+        // 从解压目录中获取INF文件列表
+        inf_list =
+            get_file_list(&inf_parent_path, "*.inf").with_context(|| "get inf list failed")?;
+
+        // 如果输入的索引路径是相对路径，则令实际实际为驱动包所在路径
+        index_path = if save_path.is_relative() {
+            drive_path.parent().unwrap().join(save_path)
+        } else {
+            save_path.to_path_buf()
+        };
+    }
+
+    if inf_list.is_empty() {
+        return Err(anyhow!(t!("no-inf-find")));
+    }
+    inf_list.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
+
+    // 创建线程池（池大小以可用 CPU 核心数为准）
+    let pool = ThreadPool::new(num_cpus::get());
+    let (tx, rx) = channel();
+
+    let base_path = Arc::new(inf_parent_path);
+    let workspace_prefix = workspace.path().to_string_lossy().into_owned();
+    let success_count = Arc::new(AtomicI32::new(0));
+    let error_count = Arc::new(AtomicI32::new(0));
+    let blank_count = Arc::new(AtomicI32::new(0));
+    let catalog_cache = Arc::new(CatalogSignatureCache::new());
+
+    // 遍历INF文件
+    for item in inf_list.clone() {
+        let tx = tx.clone();
+        let base_path = Arc::clone(&base_path);
+        let success_count = Arc::clone(&success_count);
+        let error_count = Arc::clone(&error_count);
+        let blank_count = Arc::clone(&blank_count);
+        let catalog_cache = Arc::clone(&catalog_cache);
+        let workspace_prefix = workspace_prefix.clone();
+
+        // 多线程解析INF文件
+        pool.execute(move || {
+            match InfInfo::parse_inf_with_catalog_cache(&base_path, &item, Some(&catalog_cache)) {
+                Ok(info) => {
+                    // 判断inf文件是否包含硬件信息
+                    if info.hardware.is_empty() {
+                        blank_count.fetch_add(1, Ordering::SeqCst);
+                        write_console(
+                            ConsoleType::Warning,
+                            &format!(
+                                "{}: {}",
+                                t!("no-hardware"),
+                                item.to_string_lossy().trim_start_matches(&workspace_prefix)
+                            ),
+                        );
+                        return;
+                    }
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                    let _ = tx.send(info);
+                }
+                Err(e) => {
+                    error_count.fetch_add(1, Ordering::SeqCst);
+                    write_console(
+                        ConsoleType::Error,
+                        &format!(
+                            "{}: {} ({})",
+                            t!("inf-parse-error"),
+                            item.to_string_lossy().trim_start_matches(&workspace_prefix),
+                            e
+                        ),
+                    );
+                }
+            }
+        });
+    }
+
+    // 释放主线程发送通道
+    drop(tx);
+
+    // 接收所有线程解析结果
+    let mut inf_info_list: Vec<InfInfo> = rx.into_iter().collect();
+    if inf_info_list.is_empty() {
+        return Err(anyhow!(t!("create-index-failed")));
+    }
+
+    // 对INF文件列表进行排序
+    InfInfo::sort_inf_list(&mut inf_info_list);
+
+    // 计算驱动包大小
+    let size = drive_path
+        .metadata()
+        .with_context(|| format!("get drive path metadata {}", drive_path.display()))?
+        .len();
+
+    // 获取驱动包修改时间戳
+    let timestamp = drive_path
+        .metadata()
+        .with_context(|| format!("get drive path metadata {}", drive_path.display()))?
+        .modified()
+        .with_context(|| format!("get drive path modified {}", drive_path.display()))?
+        .duration_since(UNIX_EPOCH)
+        .with_context(|| {
+            format!(
+                "get drive path duration since unix epoch {}",
+                drive_path.display()
+            )
+        })?
+        .as_secs();
+
+    // 创建索引配置文件
+    let source_exclusions = index_path
+        .strip_prefix(drive_path)
+        .ok()
+        .filter(|_| drive_path.is_dir())
+        .map(|path| {
+            vec![
+                path.to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase(),
+            ]
+        })
+        .unwrap_or_default();
+    let fingerprint = source_fingerprint_excluding(drive_path, &source_exclusions)
+        .with_context(|| "create driver source fingerprint failed")?;
+    let mut config = DriverIndex::new(size, timestamp, None, fingerprint, inf_info_list);
+    config.source_fingerprint.source_type = if drive_path.is_file() {
+        crate::driver_index::SourceType::File
+    } else {
+        crate::driver_index::SourceType::Directory
+    };
+    config.source_exclusions = source_exclusions;
+    config.source_fingerprint.exclusions = config.source_exclusions.clone();
+
+    let data = if compress {
+        // 压缩索引配置文件
+        config
+            .to_json_compress()
+            .with_context(|| "Compress config data failed")?
+    } else {
+        let json = config
+            .to_json()
+            .with_context(|| format!("Serialize config data to json {}", index_path.display()))?;
+        json.as_bytes().to_vec()
+    };
+
+    // Save atomically so an interrupted write cannot leave a corrupt index.
+    let temp_name = format!(
+        ".{}.tmp-{}",
+        index_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("driver.index"),
+        fastrand::u64(..)
+    );
+    let temp_path = index_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(temp_name);
+    let mut temp_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)
+        .with_context(|| t!("index-save-failed"))?;
+    if let Err(error) = temp_file
+        .write_all(&data)
+        .and_then(|_| temp_file.sync_all())
+    {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error).with_context(|| t!("index-save-failed"));
+    }
+    let source = HSTRING::from(temp_path.as_path());
+    let destination = HSTRING::from(index_path.as_path());
+    if let Err(error) = unsafe {
+        MoveFileExW(
+            &source,
+            &destination,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error).with_context(|| t!("index-save-failed"));
+    }
+
+    Ok((
+        inf_list.len() as u32,
+        success_count.load(Ordering::SeqCst) as u32,
+        error_count.load(Ordering::SeqCst) as u32,
+        blank_count.load(Ordering::SeqCst) as u32,
+    ))
+}
